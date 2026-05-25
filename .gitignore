@@ -11,3 +11,5 @@ model/*
 *.onnx
 data/*
 .DS_Store
+desktop.ini
+.vscode/

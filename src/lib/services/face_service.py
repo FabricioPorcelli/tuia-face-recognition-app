@@ -13,6 +13,9 @@ from lib.storage.base import EmbeddingStoreProtocol
 import os 
 import logging
 
+from insightface.app import FaceAnalysis
+import torchvision.transforms as T
+
 logger = logging.getLogger(__name__)
 
 
@@ -34,6 +37,20 @@ class FaceService:
         self.output_path = output_path
 
         os.makedirs(self.output_path, exist_ok=True)
+
+        self.face_analyzer = FaceAnalysis(
+            name="buffalo_sc",
+            root=str(model_path.parent),
+            allowed_modules=["detection"]
+        )
+        self.face_analyzer.prepare(ctx_id=-1)
+
+        self.transform = T.Compose([
+            T.ToPILImage(),
+            T.Resize((face_size, face_size)),
+            T.ToTensor(),
+            T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+        ])
 
     @staticmethod
     def _clip_xyxy(
@@ -77,30 +94,102 @@ class FaceService:
         # BGR uint8 (InsightFace / OpenCV convention)
         return image
 
+###################################################################################################################################
+
     def detect_faces(self, image: np.ndarray) -> list[tuple[int, int, int, int]]:
         """
-        Each box is (x1, y1, x2, y2) in pixels (InsightFace convention).
-        Return a list of tuples with the coordinates of the faces detected in the image.
+        Usa InsightFace (buffalo_sc) para detectar rostros.
+        Devuelve lista de bounding boxes (x1, y1, x2, y2).
         """
-        raise NotImplementedError("Not implemented")
-
+        faces = self.face_analyzer.get(image)
+        result = []
+        h, w = image.shape[:2]
+        for face in faces:
+            x1, y1, x2, y2 = [int(v) for v in face.bbox]
+            x1, y1, x2, y2 = self._clip_xyxy(x1, y1, x2, y2, h, w)
+            result.append((x1, y1, x2, y2))
+        logger.info(f"detect_faces: {len(result)} face(s) found")
+        return result
 
     def align_face(
         self, image: np.ndarray, box: tuple[int, int, int, int]
     ) -> AlignedFace:
         """
-        Crop using box (x1, y1, x2, y2) and run FaceAnalysis on the crop.
-        Return an AlignedFace object.
+        Recorta el rostro usando el bounding box.
+        Si InsightFace encontró keypoints para ese box, los incluye.
+        Siempre devuelve un AlignedFace con imagen recortada a face_size x face_size.
         """
-        raise NotImplementedError("Not implemented")
-
+        x1, y1, x2, y2 = box
+        
+        # Buscar la cara de InsightFace que más se superpone con el box dado
+        faces = self.face_analyzer.get(image)
+        best_face = None
+        best_iou = -1.0
+        for face in faces:
+            fx1, fy1, fx2, fy2 = [int(v) for v in face.bbox]
+            # Calcular IoU
+            ix1, iy1 = max(x1, fx1), max(y1, fy1)
+            ix2, iy2 = min(x2, fx2), min(y2, fy2)
+            inter_area = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+            union_area = (x2 - x1) * (y2 - y1) + (fx2 - fx1) * (fy2 - fy1) - inter_area
+            iou = inter_area / union_area if union_area > 0 else 0.0
+            if iou > best_iou:
+                best_iou = iou
+                best_face = face
+    
+        # Recorte simple + resize
+        crop = image[y1:y2, x1:x2]
+        if crop.size == 0:
+            crop = np.zeros((self.face_size, self.face_size, 3), dtype=np.uint8)
+        crop = cv2.resize(crop, (self.face_size, self.face_size))
+    
+        kps = None
+        if best_face is not None and best_face.kps is not None:
+            kps = best_face.kps - np.array([x1, y1])  # array (5, 2): ojos, nariz, comisuras boca
+    
+        logger.info(f"align_face: crop shape={crop.shape}, keypoints={'found' if kps is not None else 'none'}")
+        return AlignedFace(bbox=list(box), keypoints=kps, image=crop, embedding=None)
+        
     def extract_embedding_from_face(self, face: AlignedFace) -> list[float]:
         """
-        Extract embedding from face.
-        Return a list of floats representing the embedding of the face.
+        Extrae el embedding usando el modelo .pth entrenado en la notebook.
+        El modelo debe ser una CNN con una capa penúltima de 512 dimensiones,
+        cargada por _load_model() como un nn.Module en eval mode.
         """
-        raise NotImplementedError("Not implemented")
-        
+        import torch
+    
+        # Preprocesar el crop BGR → tensor normalizado
+        img_rgb = cv2.cvtColor(face.image, cv2.COLOR_BGR2RGB)
+        tensor = self.transform(img_rgb).unsqueeze(0)  # (1, 3, H, W)
+    
+        model = self.model
+        model.eval()
+    
+        with torch.no_grad():
+            # Extraer embedding de la penúltima capa
+            # El modelo debe exponer un método embedding() o ser un Sequential
+            # donde el último módulo es el clasificador
+            if hasattr(model, 'get_embedding'):
+                # Interfaz personalizada que definirás en la notebook
+                emb = model.get_embedding(tensor)  # (1, 512)
+            else:
+                # Fallback: remover última capa (clasificador) y usar la anterior
+                # Esto funciona para ResNet, EfficientNet, ViT de torchvision
+                children = list(model.children())
+                feature_extractor = torch.nn.Sequential(*children[:-1])
+                feature_extractor.eval()
+                emb = feature_extractor(tensor)  # (1, 512, 1, 1) o (1, 512)
+                emb = emb.flatten(start_dim=1)   # → (1, 512)
+    
+        # Normalizar L2 (importante para cosine similarity)
+        emb = torch.nn.functional.normalize(emb, p=2, dim=1)
+        embedding = emb.squeeze(0).tolist()  # lista de 512 floats
+    
+        logger.info(f"extract_embedding_from_face: embedding dim={len(embedding)}")
+        return embedding
+    
+###################################################################################################################################
+    
     def _cosine(self, a: np.ndarray, b: np.ndarray) -> float:
         denom = np.linalg.norm(a) * np.linalg.norm(b)
         if denom == 0:
