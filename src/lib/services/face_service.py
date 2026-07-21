@@ -6,15 +6,12 @@ from uuid import uuid4
 
 import cv2
 import numpy as np
-import torch
-import onnxruntime
 from lib.schemas import EmbeddingRecord, FaceDetection, PredictResult, AlignedFace
 from lib.storage.base import EmbeddingStoreProtocol
 import os 
 import logging
 
 from insightface.app import FaceAnalysis
-import torchvision.transforms as T
 
 logger = logging.getLogger(__name__)
 
@@ -33,24 +30,16 @@ class FaceService:
         self.similarity_metric = similarity_metric
         self.similarity_threshold = similarity_threshold
         self.face_size = face_size
-        self.model: any = self._load_model(model_path)
         self.output_path = output_path
 
         os.makedirs(self.output_path, exist_ok=True)
 
         self.face_analyzer = FaceAnalysis(
-            name="buffalo_sc",
+            name="buffalo_l",
             root=str(model_path.parent),
-            allowed_modules=["detection"]
+            allowed_modules=["detection", "recognition"]
         )
         self.face_analyzer.prepare(ctx_id=-1)
-
-        self.transform = T.Compose([
-            T.ToPILImage(),
-            T.Resize((face_size, face_size)),
-            T.ToTensor(),
-            T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-        ])
 
     @staticmethod
     def _clip_xyxy(
@@ -75,18 +64,6 @@ class FaceService:
             for i in range(len(kps))
         }
 
-
-    def _load_model(self, model_path: Path) -> any:
-        mp = Path(model_path)
-        if not mp.exists():
-            raise ValueError(f"Model path does not exist: {model_path}")
-        suf = mp.suffix.lower()
-        if suf == ".pth":
-            return torch.load(mp, map_location="cpu", weights_only=False)
-        if suf == ".onnx":
-            return onnxruntime.InferenceSession(str(mp))
-        raise ValueError(f"Unsupported model format (expected .pth or .onnx): {model_path}")
-
     def _load_image(self, source_path: str) -> np.ndarray:
         image = cv2.imread(source_path)
         if image is None:
@@ -98,7 +75,7 @@ class FaceService:
 
     def detect_faces(self, image: np.ndarray) -> list[tuple[int, int, int, int]]:
         """
-        Usa InsightFace (buffalo_sc) para detectar rostros.
+        Usa InsightFace (buffalo_l) para detectar rostros.
         Devuelve lista de bounding boxes (x1, y1, x2, y2).
         """
         faces = self.face_analyzer.get(image)
@@ -148,45 +125,13 @@ class FaceService:
             kps = best_face.kps - np.array([x1, y1])  # array (5, 2): ojos, nariz, comisuras boca
     
         logger.info(f"align_face: crop shape={crop.shape}, keypoints={'found' if kps is not None else 'none'}")
-        return AlignedFace(bbox=list(box), keypoints=kps, image=crop, embedding=None)
+        embedding = best_face.embedding.tolist() if best_face is not None and best_face.embedding is not None else None
+        return AlignedFace(bbox=list(box), keypoints=kps, image=crop, embedding=embedding)
         
     def extract_embedding_from_face(self, face: AlignedFace) -> list[float]:
-        """
-        Extrae el embedding usando el modelo .pth entrenado en la notebook.
-        El modelo debe ser una CNN con una capa penúltima de 512 dimensiones,
-        cargada por _load_model() como un nn.Module en eval mode.
-        """
-        import torch
-    
-        # Preprocesar el crop BGR → tensor normalizado
-        img_rgb = cv2.cvtColor(face.image, cv2.COLOR_BGR2RGB)
-        tensor = self.transform(img_rgb).unsqueeze(0)  # (1, 3, H, W)
-    
-        model = self.model
-        model.eval()
-    
-        with torch.no_grad():
-            # Extraer embedding de la penúltima capa
-            # El modelo debe exponer un método embedding() o ser un Sequential
-            # donde el último módulo es el clasificador
-            if hasattr(model, 'get_embedding'):
-                # Interfaz personalizada que definirás en la notebook
-                emb = model.get_embedding(tensor)  # (1, 512)
-            else:
-                # Fallback: remover última capa (clasificador) y usar la anterior
-                # Esto funciona para ResNet, EfficientNet, ViT de torchvision
-                children = list(model.children())
-                feature_extractor = torch.nn.Sequential(*children[:-1])
-                feature_extractor.eval()
-                emb = feature_extractor(tensor)  # (1, 512, 1, 1) o (1, 512)
-                emb = emb.flatten(start_dim=1)   # → (1, 512)
-    
-        # Normalizar L2 (importante para cosine similarity)
-        emb = torch.nn.functional.normalize(emb, p=2, dim=1)
-        embedding = emb.squeeze(0).tolist()  # lista de 512 floats
-    
-        logger.info(f"extract_embedding_from_face: embedding dim={len(embedding)}")
-        return embedding
+        if face.embedding is None:
+            raise ValueError("No embedding available from buffalo_l recognition")
+        return face.embedding
     
 ###################################################################################################################################
     
